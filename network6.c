@@ -81,7 +81,7 @@ void register_file(const char* filename, const char* hash, int size, const char*
 // 3. Print all current server records
 void print_all_files() {
     struct FileInfo* current = head;
-    printf("Stored File Information:\n");
+    printf("\n--- Stored File Information ---\n");
     while (current != NULL) {
         printf("Filename: %s\n", current->filename);
         printf("    Full Hash: %s\n", current->fullFileHash);
@@ -91,13 +91,14 @@ void print_all_files() {
         }
         current = current->next;
     }
+    printf("-------------------------------\n\n");
 }
 
 // 4. Parse JSON and handle requests (Added socket and src parameters to send responses)
 void format_message(char *json_string, const char *client_ip, int client_port, int sockfd, struct sockaddr_in *client_addr) {
     cJSON *root = cJSON_Parse(json_string); 
     if (!root) {
-        printf("Error: Invalid JSON format.\n");
+        printf(">>> Error: Invalid JSON format received from %s:%d\n", client_ip, client_port);
         return;
     }
 
@@ -127,7 +128,7 @@ void format_message(char *json_string, const char *client_ip, int client_port, i
         char *response_str = cJSON_PrintUnformatted(response_root); // Unformatted to save bandwidth
         if (response_str) {
             sendto(sockfd, response_str, strlen(response_str), 0, (struct sockaddr*)client_addr, sizeof(*client_addr));
-            printf("Responded to query from %s:%d\n", client_ip, client_port);
+            printf(">>> Responded to 'query' from %s:%d\n", client_ip, client_port);
             free(response_str);
         }
         cJSON_Delete(response_root);
@@ -135,6 +136,7 @@ void format_message(char *json_string, const char *client_ip, int client_port, i
     } else if (cJSON_IsArray(root)) {
         // Handling file registration updates (from Lab 5 logic)
         int array_size = cJSON_GetArraySize(root);
+        int stored_count = 0;
         for (int i = 0; i < array_size; i++) {
             cJSON *file_item = cJSON_GetArrayItem(root, i);
             cJSON *name_obj = cJSON_GetObjectItemCaseSensitive(file_item, "filename");
@@ -145,16 +147,53 @@ void format_message(char *json_string, const char *client_ip, int client_port, i
                 cJSON_IsString(hash_obj) && (hash_obj->valuestring != NULL) &&
                 cJSON_IsNumber(size_obj)) {
                 register_file(name_obj->valuestring, hash_obj->valuestring, size_obj->valueint, client_ip, client_port);
+                stored_count++;
             } 
         }
+        printf(">>> Processed Array: Successfully stored %d files from %s:%d\n", stored_count, client_ip, client_port);
     } 
     else if (cJSON_IsObject(root)) {
+        // =====================================================================
+        // ENHANCED FALLBACK: Catch all objects (including "upload" requests)
+        // =====================================================================
         cJSON *name_obj = cJSON_GetObjectItemCaseSensitive(root, "filename");
         cJSON *hash_obj = cJSON_GetObjectItemCaseSensitive(root, "fullFileHash");
-        cJSON *size_obj = cJSON_GetObjectItemCaseSensitive(root, "fileSize"); // <-- CHANGED
+        cJSON *size_obj = cJSON_GetObjectItemCaseSensitive(root, "fileSize");
 
-        if (cJSON_IsString(name_obj) && cJSON_IsString(hash_obj) && cJSON_IsNumber(size_obj)) {
-            register_file(name_obj->valuestring, hash_obj->valuestring, size_obj->valueint, client_ip, client_port);
+        // Case A: The JSON directly contains the file metadata at the root level
+        if (name_obj && hash_obj && size_obj) {
+            if (cJSON_IsString(name_obj) && cJSON_IsString(hash_obj) && cJSON_IsNumber(size_obj)) {
+                register_file(name_obj->valuestring, hash_obj->valuestring, size_obj->valueint, client_ip, client_port);
+                printf(">>>  Successfully stored file metadata: %s from %s:%d\n", name_obj->valuestring, client_ip, client_port);
+            } else {
+                printf(">>>  Error: Data type mismatch in incoming JSON from %s:%d\n", client_ip, client_port);
+                printf("    - filename is string? %d\n", cJSON_IsString(name_obj));
+                printf("    - fullFileHash is string? %d\n", cJSON_IsString(hash_obj));
+                printf("    - fileSize is number? %d (If 0, client might be sending a string!)\n", cJSON_IsNumber(size_obj));
+            }
+        } 
+        // Case B: The JSON is nested (e.g., {"requestType": "upload", "files": [...]})
+        else {
+            cJSON *files_array = cJSON_GetObjectItemCaseSensitive(root, "files");
+            if (cJSON_IsArray(files_array)) {
+                int array_size = cJSON_GetArraySize(files_array);
+                int stored_count = 0;
+                for (int i = 0; i < array_size; i++) {
+                    cJSON *file_item = cJSON_GetArrayItem(files_array, i);
+                    cJSON *f_name = cJSON_GetObjectItemCaseSensitive(file_item, "filename");
+                    cJSON *f_hash = cJSON_GetObjectItemCaseSensitive(file_item, "fullFileHash");
+                    cJSON *f_size = cJSON_GetObjectItemCaseSensitive(file_item, "fileSize");
+
+                    if (cJSON_IsString(f_name) && cJSON_IsString(f_hash) && cJSON_IsNumber(f_size)) {
+                        register_file(f_name->valuestring, f_hash->valuestring, f_size->valueint, client_ip, client_port);
+                        stored_count++;
+                    }
+                }
+                printf(">>> Processed nested 'files' array: Successfully stored %d files from %s:%d\n", stored_count, client_ip, client_port);
+            } else {
+                // Case C: Completely unrecognized format. Print it out for debugging.
+                printf(">>> Warning: Received unhandled Object missing required file fields. Raw JSON:\n%s\n", json_string);
+            }
         }
     }
 
@@ -193,6 +232,8 @@ int main(){
     setsockopt(socketfd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)); 
     char buf[65536];  
 
+    printf("Server listening for incoming requests...\n");
+
     while (1) {
         int n = recvfrom(socketfd, buf, sizeof(buf) - 1, 0,
                          (struct sockaddr*)&src, &len);
@@ -206,12 +247,10 @@ int main(){
         char *client_ip = inet_ntoa(src.sin_addr);
         int client_port = ntohs(src.sin_port);
         
-        printf("Received data from Client %s:%d\n", client_ip, client_port);
-        
         // Pass socketfd and &src to reply to queries
         format_message(buf, client_ip, client_port, socketfd, &src);
         
-        // You can leave this to verify your server state, or comment it out if it prints too much
+        // Always print current state after processing any message
         print_all_files();
     }
 }
